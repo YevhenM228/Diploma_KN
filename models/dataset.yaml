@@ -1,0 +1,13 @@
+
+train: /content/plate-detect-5/train/images
+val: /content/plate-detect-5/valid/images
+test: /content/plate-detect-5/test/images
+nc: 1
+names: ['licence']
+
+roboflow:
+  workspace: ai22-t3ygh
+  project: plate-detect-v2vpn
+  version: 5
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/ai22-t3ygh/plate-detect-v2vpn/dataset/5

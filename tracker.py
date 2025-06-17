@@ -1,0 +1,200 @@
+# tracker.py · v3.1 (08-06-2025)
+from __future__ import annotations
+import os, time, shutil, tempfile, cv2, numpy as np
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
+from collections import Counter
+from ultralytics import YOLO
+from sort.sort import Sort
+from utils.visual import corner_box, overlay_stats, put_label
+from utils.bbox import BBox
+from utils.serializer import write_csv, write_json, COCO_ID2NAME
+
+YOLO_VEH_PATH = "yolo11n.pt"
+YOLO_PLATE_PATH = "models/runs/detect/train2/weights/best.pt"
+VALID_VEH_IDS = {2}
+
+CONF_VEH, CONF_PLATE = 0.30, 0.25
+IOU_TH_NMS = 0.45
+IOU_LP2CAR = 0.01 
+
+SORT_KW = dict(max_age=60, min_hits=3, iou_threshold=0.35)
+EMA_A = 0.1
+KEEP_TMP = False
+
+veh_net = YOLO(YOLO_VEH_PATH)
+plate_net = YOLO(YOLO_PLATE_PATH)
+
+def calculate_iou(box_a, box_b) -> float:
+    """
+    """
+    box_a, box_b = map(np.asarray, (box_a, box_b))
+    if box_a.size != 4 or box_b.size != 4:
+        return 0.0
+
+    xA = max(box_a[0], box_b[0])
+    yA = max(box_a[1], box_b[1])
+    xB = min(box_a[2], box_b[2])
+    yB = min(box_a[3], box_b[3])
+
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    if inter == 0:
+        return 0.0
+
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union = float(area_a + area_b - inter)
+    return inter / union if union > 1e-6 else 0.0
+
+def detection_on_image(rgb: np.ndarray) -> Tuple[np.ndarray, str, str, str]:
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    coco = veh_net(bgr, conf=CONF_VEH, iou=IOU_TH_NMS, verbose=False)[0].boxes.data
+    veh = [d.tolist() for d in coco if int(d[5]) in VALID_VEH_IDS]
+    lp = plate_net(bgr, conf=CONF_PLATE, iou=IOU_TH_NMS, verbose=False)[0].boxes.data.tolist()
+    objs = {
+        i + 1: {
+            "vehicle_type": COCO_ID2NAME[int(v[5])],
+            "vehicle_bbox": [int(v[0]), int(v[1]), int(v[2]), int(v[3])],
+            "license_plate": {"bbox": [], "bbox_score": 0.0},
+            "frame_start": 0,
+            "frame_end": 0
+        }
+        for i, v in enumerate(veh)
+    }
+    for lx1, ly1, lx2, ly2, sc, _ in lp:
+        best_tid, best_iou = None, 0.0
+        for tid, info in objs.items():
+            iou = calculate_iou([lx1, ly1, lx2, ly2], info["vehicle_bbox"])
+            if iou > best_iou:
+                best_tid, best_iou = tid, iou
+        if best_tid is None or best_iou < IOU_LP2CAR:
+            continue
+        if sc > objs[best_tid]["license_plate"]["bbox_score"]:
+            objs[best_tid]["license_plate"] = {
+                "bbox": [int(lx1), int(ly1), int(lx2), int(ly2)],
+                "bbox_score": float(sc)
+            }
+    tmp = tempfile.mkdtemp()
+    img_path = os.path.join(tmp, "annot_img.png")  # <- Зберігаємо як .png
+    csv_p = os.path.join(tmp, "img.csv")
+    json_p = os.path.join(tmp, "img.json")
+    write_csv(objs, csv_p)
+    write_json(objs, json_p)
+
+    vis = bgr.copy()
+    for l in lp:
+        cv2.rectangle(vis, (int(l[0]), int(l[1])), (int(l[2]), int(l[3])), (255, 0, 0), 2)
+        put_label(vis, "LP", l[0], l[1] - 6, (255, 0, 0))
+    for tid, info in objs.items():
+        box = BBox(*info["vehicle_bbox"])
+        corner_box(vis, box)
+        put_label(vis, f"ID:{tid}", box.x1, box.y1 - 6)
+        put_label(vis, info["vehicle_type"].upper(), box.x1, box.y2 + 18)
+    put_label(vis, f"Vehicles: {len(objs)}", 10, 26, (255, 255, 255))
+
+    cv2.imwrite(img_path, vis)
+    return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), json_p, csv_p, img_path
+
+
+def detection_on_video(vfile) -> Tuple[np.ndarray, str, str, str]:
+    path = getattr(vfile, "name", str(vfile))
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise IOError(f"Не вдалося відкрити файл: {path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    W, H = int(cap.get(3)), int(cap.get(4))
+
+    tmp = tempfile.mkdtemp()
+    mp4 = os.path.join(tmp, "annot.mp4")
+    csv_p = os.path.join(tmp, "vid.csv")
+    json_p = os.path.join(tmp, "vid.json")
+    writer = cv2.VideoWriter(mp4, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+
+    tracker = Sort(**SORT_KW)
+    objs: Dict[int, Any] = {}
+    frame_idx, ema_fps, first_rgb = 0, None, None
+
+    while True:
+        tic = time.time()
+        ok, frame = cap.read()
+        if not ok:
+            break
+        all_detections = veh_net(frame, conf=CONF_VEH, iou=IOU_TH_NMS, verbose=False)[0].boxes.data.tolist()
+        valid_veh_detections = [d for d in all_detections if int(d[5]) in VALID_VEH_IDS]
+
+        veh_for_tracker = [[*d[:4], d[4]] for d in valid_veh_detections]
+        tracks = tracker.update(np.asarray(veh_for_tracker, float) if veh_for_tracker else np.empty((0, 5)))
+        lp = plate_net(frame, conf=CONF_PLATE, iou=IOU_TH_NMS, verbose=False)[0].boxes.data.tolist()
+
+        active_tracks = {int(t[4]): t[:4] for t in tracks}
+
+        for tid, track_bbox in active_tracks.items():
+
+            best_iou, best_class_id = 0.0, -1
+            for det in valid_veh_detections:
+                iou = calculate_iou(track_bbox, det[:4])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_class_id = int(det[5])
+
+            vehicle_class_name = COCO_ID2NAME.get(best_class_id, "VEHICLE")
+
+            if tid not in objs:
+                objs[tid] = {"frame_start": frame_idx, "license_plate": {}}
+
+            objs[tid].update({
+                "vehicle_type": vehicle_class_name,
+                "vehicle_bbox": [int(b) for b in track_bbox],
+                "frame_end": frame_idx
+            })
+
+        for lx1, ly1, lx2, ly2, sc, _ in lp:
+            best_tid, best_iou = None, 0.0
+            for tid, info in objs.items():
+                if tid not in active_tracks: continue # Порівнюємо тільки з активними треками
+                iou = calculate_iou([lx1, ly1, lx2, ly2], info["vehicle_bbox"])
+                if iou > best_iou:
+                    best_tid, best_iou = tid, iou
+
+            if best_tid is not None and best_iou > IOU_LP2CAR:
+                if sc > objs[best_tid]["license_plate"].get("bbox_score", 0):
+                    objs[best_tid]["license_plate"] = {
+                        "bbox": [int(lx1), int(ly1), int(lx2), int(ly2)],
+                        "bbox_score": float(sc)
+                    }
+        inst_fps = 1.0 / max(time.time() - tic, 1e-3)
+        ema_fps = inst_fps if ema_fps is None else EMA_A * inst_fps + (1 - EMA_A) * ema_fps
+
+        active_classes = [objs[tid]["vehicle_type"] for tid in active_tracks.keys() if tid in objs]
+        counts = Counter(active_classes)
+
+        vis = frame.copy()
+        for l in lp:
+            cv2.rectangle(vis, (int(l[0]), int(l[1])), (int(l[2]), int(l[3])), (255, 0, 0), 2)
+            put_label(vis, "LP", l[0], l[1] - 6, (255, 0, 0))
+
+        for tid, bbox in active_tracks.items():
+            x1, y1, x2, y2 = map(int, bbox)
+            corner_box(vis, BBox(x1, y1, x2, y2))
+            put_label(vis, f"ID:{tid}", x1, y1 - 6)
+            if tid in objs:
+                put_label(vis, objs[tid]["vehicle_type"].upper(), x1, y2 + 18)
+
+        overlay_stats(vis, ema_fps, counts)
+
+        if first_rgb is None:
+            first_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+        writer.write(vis)
+        frame_idx += 1
+
+    cap.release()
+    writer.release()
+    write_csv(objs, csv_p)
+    write_json(objs, json_p)
+    return first_rgb, json_p, csv_p, mp4
+
+if __name__ == "__main__":
+    dummy = np.zeros((480, 640, 3), np.uint8)
+    rgb, js, cs, img_path = detection_on_image(dummy)
+    print("Self-test OK:", js, cs)
